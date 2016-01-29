@@ -1,0 +1,152 @@
+From 69e34f7d8ee42d5fe2aa77d21d4a06c0b1429dd9 Mon Sep 17 00:00:00 2001
+Message-Id: <69e34f7d8ee42d5fe2aa77d21d4a06c0b1429dd9.1452107641.git.kanaka.d.juvva@linux.intel.com>
+In-Reply-To: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+References: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+From: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+Date: Wed, 11 Nov 2015 20:19:15 -0800
+Subject: [PATCH v9-pre-release_for_4_3_rc4-01062016 1/5] perf,x86: skip
+ intel_cqm_stable if no CQM event is using a RMID
+
+Cache Quality of Service Monitoring (CQM) and Memory Bandwidth
+Monitoring (MBM) are complementary technologies. One technology
+doesn't imply the other technology. If both technologies are
+available in a cpu model, a RMID can be shared between CQM and MBM
+monitoring events. If only MBM technology is present in a CPU model
+or no CQM events are using a RMID, then the RMID doesn't measure
+LLC occupancy.
+
+In preparation for the upcoming MBM support, we need to allow an
+event to skip intel_cqm_stable() when freeing its RMID if the RMID
+isn't measuring LLC occupancy. This is because RMIDs that measure
+LLC occupancy need to be recycled before they can be used for a new
+event. No such requirement exists for those RMIDs used for MBM,
+and they can be placed directly onto the free list and can be
+reused immediately without waiting for the associated RMID data to
+"stabilize".
+
+Signed-off-by: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+---
+ arch/x86/kernel/cpu/perf_event_intel_cqm.c | 70 ++++++++++++++++++++----------
+ 1 file changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_cqm.c b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index 377e8f8..f68969d 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@ -125,8 +125,11 @@ struct cqm_rmid_entry {
+ 	enum rmid_recycle_state state;
+ 	struct list_head list;
+ 	unsigned long queue_time;
++	bool is_cqm;
+ };
+ 
++static void intel_cqm_free_rmid(struct cqm_rmid_entry *entry);
++
+ /*
+  * cqm_rmid_free_lru - A least recently used list of RMIDs.
+  *
+@@ -208,7 +211,16 @@ static void __put_rmid(u32 rmid)
+ 	entry->queue_time = jiffies;
+ 	entry->state = RMID_YOUNG;
+ 
+-	list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
++	/*
++	 * If the RMID is used for measuring LLC_OCCUPANCY, put it in
++	 * cqm_rmid_limbo_lru so that it gets recycled. Otherwise, RMID
++	 * is put in free list and is immediately available for reuse
++	 */
++	if (entry->is_cqm)
++		list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
++	else
++		intel_cqm_free_rmid(entry);
++
+ }
+ 
+ static int intel_cqm_setup_rmid_cache(void)
+@@ -232,6 +244,7 @@ static int intel_cqm_setup_rmid_cache(void)
+ 
+ 		INIT_LIST_HEAD(&entry->list);
+ 		entry->rmid = r;
++		entry->is_cqm = false;
+ 		cqm_rmid_ptrs[r] = entry;
+ 
+ 		list_add_tail(&entry->list, &cqm_rmid_free_lru);
+@@ -494,6 +507,31 @@ static bool intel_cqm_sched_in_event(u32 rmid)
+ 	return false;
+ }
+ 
++static void intel_cqm_free_rmid(struct cqm_rmid_entry *entry)
++{
++	/*
++	 * The rotation RMID gets priority if it's currently invalid.
++	 *
++	 * In which case, skip adding the RMID to the the free lru.
++	 */
++	 if (!__rmid_valid(intel_cqm_rotation_rmid)) {
++		intel_cqm_rotation_rmid = entry->rmid;
++		return;
++	}
++
++	/*
++	 * If we have groups waiting for RMIDs, hand them one now
++	 * provided they don't conflict.
++	 */
++	if (intel_cqm_sched_in_event(entry->rmid))
++		return;
++
++	/*
++	 * Otherwise place it onto the free list.
++	 */
++	list_add_tail(&entry->list, &cqm_rmid_free_lru);
++}
++
+ /*
+  * Initially use this constant for both the limbo queue time and the
+  * rotation timer interval, pmu::hrtimer_interval_ms.
+@@ -581,28 +619,7 @@ static bool intel_cqm_rmid_stabilize(unsigned int *available)
+ 			continue;
+ 
+ 		list_del(&entry->list);	/* remove from limbo */
+-
+-		/*
+-		 * The rotation RMID gets priority if it's
+-		 * currently invalid. In which case, skip adding
+-		 * the RMID to the the free lru.
+-		 */
+-		if (!__rmid_valid(intel_cqm_rotation_rmid)) {
+-			intel_cqm_rotation_rmid = entry->rmid;
+-			continue;
+-		}
+-
+-		/*
+-		 * If we have groups waiting for RMIDs, hand
+-		 * them one now provided they don't conflict.
+-		 */
+-		if (intel_cqm_sched_in_event(entry->rmid))
+-			continue;
+-
+-		/*
+-		 * Otherwise place it onto the free list.
+-		 */
+-		list_add_tail(&entry->list, &cqm_rmid_free_lru);
++		intel_cqm_free_rmid(entry);
+ 	}
+ 
+ 
+@@ -872,6 +889,13 @@ static void intel_cqm_setup_event(struct perf_event *event,
+ 	else
+ 		rmid = __get_rmid();
+ 
++	if (event->attr.config == QOS_L3_OCCUP_EVENT_ID) {
++		struct cqm_rmid_entry *entry;
++
++		entry = __rmid_entry(rmid);
++		entry->is_cqm = true;
++	}
++
+ 	event->hw.cqm_rmid = rmid;
+ }
+ 
+-- 
+2.1.0
+

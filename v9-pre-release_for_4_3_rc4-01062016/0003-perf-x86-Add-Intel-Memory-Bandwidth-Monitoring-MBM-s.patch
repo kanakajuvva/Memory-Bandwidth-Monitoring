@@ -1,0 +1,458 @@
+From be0e25380a3285cc54065f0dd0108e412f29e0f0 Mon Sep 17 00:00:00 2001
+Message-Id: <be0e25380a3285cc54065f0dd0108e412f29e0f0.1452107641.git.kanaka.d.juvva@linux.intel.com>
+In-Reply-To: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+References: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+From: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+Date: Thu, 12 Nov 2015 01:00:02 -0800
+Subject: [PATCH v9-pre-release_for_4_3_rc4-01062016 3/5] perf,x86: Add Intel
+ Memory Bandwidth Monitoring (MBM) support
+
+Intel Xeon Processors support Memory Bandwidth Monitoring (MBM) that tracks
+the memory bandwidth usage for a task or task group. Intel MBM builds
+on Cache Monitoring Technology (CMT) infrastructure and allows monitoring
+of bandwidth from one level of the cache hierarchy to the next - in this
+case focusing on the L3 cache, which is typically backed directly by
+system memory.
+
+To support MBM feature, following two types of events are added to the
+intel_cqm_pmu PMU in the Linux Kernel:
+
+local memory bandwidth
+total memory bandwidth
+
+Local memory bandwidth monitoring event tracks memory bandwidth
+consumption as a result of local memory accesses
+Total memory bandwidth monitoring event tracks  (local memory bandwidth
++ QPI bandwidth). Where QPI bandwidth accounts for off chip memory
+accesses.
+
+MBM presence is detected during run time and its sub-features are read
+using CPUID leaf; the sub-features are upscaling factor and number of
+RMIDs per socket. Upscaling factor, when multiplied by bandwidth that
+was calculated using MSR values, gives the actual bandwidth value in
+Bytes/sec. Kernel driver sets the .scale values to Upscaling factor
+divided by 1.048e6. Perf userspace uses .scale to convert bandwidth
+units to MB/sec.
+
+MBM counters can overflow at most once in a second. Hence counters must be
+read before another overflow occurs and MSR reads must be adjusted taking
+overflow into consideration. To provide this functionality, a high
+resolution timer per cpu is created which facilitates the triggering of MSR
+reads for every one second.
+
+Signed-off-by: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+---
+ arch/x86/include/asm/cpufeature.h          |   2 +
+ arch/x86/kernel/cpu/common.c               |   4 +-
+ arch/x86/kernel/cpu/perf_event_intel_cqm.c | 263 +++++++++++++++++++++++++++--
+ 3 files changed, 258 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/include/asm/cpufeature.h b/arch/x86/include/asm/cpufeature.h
+index e4f8010..9170481 100644
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -254,6 +254,8 @@
+ 
+ /* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:1 (edx), word 12 */
+ #define X86_FEATURE_CQM_OCCUP_LLC (12*32+ 0) /* LLC occupancy monitoring if 1 */
++#define X86_FEATURE_CQM_MBM_TOTAL (12*32 + 1) /* LLC Total MBM monitoring  */
++#define X86_FEATURE_CQM_MBM_LOCAL (12*32 + 2) /* LLC Local MBM monitoring  */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000008 (ebx), word 13 */
+ #define X86_FEATURE_CLZERO	(13*32+0) /* CLZERO instruction */
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 4ddd780..032fee9 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -644,7 +644,9 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 			/* QoS sub-leaf, EAX=0Fh, ECX=1 */
+ 			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
+ 			c->x86_capability[12] = edx;
+-			if (cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) {
++			if ((cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC))
++			     || ((cpu_has(c, X86_FEATURE_CQM_MBM_TOTAL))
++			     ||  (cpu_has(c, X86_FEATURE_CQM_MBM_LOCAL)))) {
+ 				c->x86_cache_max_rmid = ecx;
+ 				c->x86_cache_occ_scale = ebx;
+ 			}
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_cqm.c b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index 2950654..2a656f1 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@ -13,8 +13,15 @@
+ #define MSR_IA32_QM_CTR		0x0c8e
+ #define MSR_IA32_QM_EVTSEL	0x0c8d
+ 
++/*
++ * Expected time interval in ms between consecutive MSR reads for a given rmid
++ */
++#define MBM_TIME_DELTA_EXP	1000
++
+ static u32 cqm_max_rmid = -1;
+ static unsigned int cqm_l3_scale; /* supposedly cacheline size */
++static bool cqm_llc_occ, is_mbm;
++static int mbm_socket_max = 8;
+ 
+ /**
+  * struct intel_pqr_state - State cache for the PQR MSR
+@@ -42,6 +49,49 @@ struct intel_pqr_state {
+  * interrupts disabled, which is sufficient for the protection.
+  */
+ static DEFINE_PER_CPU(struct intel_pqr_state, pqr_state);
++static DEFINE_PER_CPU(struct mbm_pmu *, mbm_pmu);
++
++/**
++ * struct mbm_pmu - mbm events per cpu
++ * @n_active:       number of active events for this pmu
++ * @active_list:    linked list for perf events for this pmu
++ * @pmu:            pmu per cpu
++ * @timer_interval: pmu's hrtimer period
++ * @hrtimer:        periodic high resolution timer for this pmu
++ *                  intel_mbm_event_update is the callback function that gets
++ *                  triggered by hrtimer and profiles for a new mbm sample.
++ */
++struct mbm_pmu {
++	int              n_active;
++	struct list_head active_list;
++	struct pmu       *pmu;
++	ktime_t          timer_interval;
++	struct hrtimer   hrtimer;
++};
++
++/**
++ * struct sample - mbm event's (local or total) data
++ * @bytes:         previous MSR value
++ * @bandwidth:     memory bandwidth
++ * @prev_time:     time stamp of previous sample i.e. {bytes, bandwidth}
++ */
++struct sample {
++	u64 bytes;
++	u64 bandwidth;
++	ktime_t prev_time;
++};
++
++/*
++ * samples profiled for total memory bandwidth type events
++ */
++static struct sample *mbm_total;
++
++/*
++ * samples profiled for local memory bandwidth type events
++ */
++static struct sample *mbm_local;
++
++static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer);
+ 
+ /*
+  * Protects cache_cgroups and cqm_rmid_free_lru and cqm_rmid_limbo_lru.
+@@ -65,7 +115,7 @@ static cpumask_t cqm_cpumask;
+ #define RMID_VAL_ERROR		(1ULL << 63)
+ #define RMID_VAL_UNAVAIL	(1ULL << 62)
+ 
+-#define QOS_L3_OCCUP_EVENT_ID	(1 << 0)
++#define QOS_L3_OCCUP_EVENT_ID	0x01
+ 
+ #define QOS_EVENT_MASK	QOS_L3_OCCUP_EVENT_ID
+ 
+@@ -1009,6 +1059,23 @@ out:
+ 	return __perf_event_count(event);
+ }
+ 
++static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
++{
++	struct mbm_pmu *pmu = __this_cpu_read(mbm_pmu);
++
++	if (!pmu->n_active)
++		return HRTIMER_NORESTART;
++	return HRTIMER_RESTART;
++}
++
++static void mbm_hrtimer_init(struct mbm_pmu *pmu)
++{
++	struct hrtimer *hr = &pmu->hrtimer;
++
++	hrtimer_init(hr, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hr->function = mbm_hrtimer_handle;
++}
++
+ static void intel_cqm_event_start(struct perf_event *event, int mode)
+ {
+ 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
+@@ -1169,6 +1236,30 @@ EVENT_ATTR_STR(llc_occupancy.unit, intel_cqm_llc_unit, "Bytes");
+ EVENT_ATTR_STR(llc_occupancy.scale, intel_cqm_llc_scale, NULL);
+ EVENT_ATTR_STR(llc_occupancy.snapshot, intel_cqm_llc_snapshot, "1");
+ 
++EVENT_ATTR_STR(total_bw, intel_cqm_total_bw, "event=0x02");
++EVENT_ATTR_STR(total_bw.per-pkg, intel_cqm_total_bw_pkg, "1");
++EVENT_ATTR_STR(total_bw.unit, intel_cqm_total_bw_unit, "MB/sec");
++EVENT_ATTR_STR(total_bw.scale, intel_cqm_total_bw_scale, NULL);
++EVENT_ATTR_STR(total_bw.snapshot, intel_cqm_total_bw_snapshot, "1");
++
++EVENT_ATTR_STR(local_bw, intel_cqm_local_bw, "event=0x03");
++EVENT_ATTR_STR(local_bw.per-pkg, intel_cqm_local_bw_pkg, "1");
++EVENT_ATTR_STR(local_bw.unit, intel_cqm_local_bw_unit, "MB/sec");
++EVENT_ATTR_STR(local_bw.scale, intel_cqm_local_bw_scale, NULL);
++EVENT_ATTR_STR(local_bw.snapshot, intel_cqm_local_bw_snapshot, "1");
++
++EVENT_ATTR_STR(avg_total_bw, intel_cqm_avg_total_bw, "event=0x04");
++EVENT_ATTR_STR(avg_total_bw.per-pkg, intel_cqm_avg_total_bw_pkg, "1");
++EVENT_ATTR_STR(avg_total_bw.unit, intel_cqm_avg_total_bw_unit, "MB/sec");
++EVENT_ATTR_STR(avg_total_bw.scale, intel_cqm_avg_total_bw_scale, NULL);
++EVENT_ATTR_STR(avg_total_bw.snapshot, intel_cqm_avg_total_bw_snapshot, "1");
++
++EVENT_ATTR_STR(avg_local_bw, intel_cqm_avg_local_bw, "event=0x05");
++EVENT_ATTR_STR(avg_local_bw.per-pkg, intel_cqm_avg_local_bw_pkg, "1");
++EVENT_ATTR_STR(avg_local_bw.unit, intel_cqm_avg_local_bw_unit, "MB/sec");
++EVENT_ATTR_STR(avg_local_bw.scale, intel_cqm_avg_local_bw_scale, NULL);
++EVENT_ATTR_STR(avg_local_bw.snapshot, intel_cqm_avg_local_bw_snapshot, "1");
++
+ static struct attribute *intel_cqm_events_attr[] = {
+ 	EVENT_PTR(intel_cqm_llc),
+ 	EVENT_PTR(intel_cqm_llc_pkg),
+@@ -1178,9 +1269,62 @@ static struct attribute *intel_cqm_events_attr[] = {
+ 	NULL,
+ };
+ 
++static struct attribute *intel_mbm_events_attr[] = {
++	EVENT_PTR(intel_cqm_total_bw),
++	EVENT_PTR(intel_cqm_local_bw),
++	EVENT_PTR(intel_cqm_avg_total_bw),
++	EVENT_PTR(intel_cqm_avg_local_bw),
++	EVENT_PTR(intel_cqm_total_bw_pkg),
++	EVENT_PTR(intel_cqm_local_bw_pkg),
++	EVENT_PTR(intel_cqm_avg_total_bw_pkg),
++	EVENT_PTR(intel_cqm_avg_local_bw_pkg),
++	EVENT_PTR(intel_cqm_total_bw_unit),
++	EVENT_PTR(intel_cqm_local_bw_unit),
++	EVENT_PTR(intel_cqm_avg_total_bw_unit),
++	EVENT_PTR(intel_cqm_avg_local_bw_unit),
++	EVENT_PTR(intel_cqm_total_bw_scale),
++	EVENT_PTR(intel_cqm_local_bw_scale),
++	EVENT_PTR(intel_cqm_avg_total_bw_scale),
++	EVENT_PTR(intel_cqm_avg_local_bw_scale),
++	EVENT_PTR(intel_cqm_total_bw_snapshot),
++	EVENT_PTR(intel_cqm_local_bw_snapshot),
++	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
++	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
++	NULL,
++};
++
++static struct attribute *intel_cmt_mbm_events_attr[] = {
++	EVENT_PTR(intel_cqm_llc),
++	EVENT_PTR(intel_cqm_total_bw),
++	EVENT_PTR(intel_cqm_local_bw),
++	EVENT_PTR(intel_cqm_avg_total_bw),
++	EVENT_PTR(intel_cqm_avg_local_bw),
++	EVENT_PTR(intel_cqm_llc_pkg),
++	EVENT_PTR(intel_cqm_total_bw_pkg),
++	EVENT_PTR(intel_cqm_local_bw_pkg),
++	EVENT_PTR(intel_cqm_avg_total_bw_pkg),
++	EVENT_PTR(intel_cqm_avg_local_bw_pkg),
++	EVENT_PTR(intel_cqm_llc_unit),
++	EVENT_PTR(intel_cqm_total_bw_unit),
++	EVENT_PTR(intel_cqm_local_bw_unit),
++	EVENT_PTR(intel_cqm_avg_total_bw_unit),
++	EVENT_PTR(intel_cqm_avg_local_bw_unit),
++	EVENT_PTR(intel_cqm_llc_scale),
++	EVENT_PTR(intel_cqm_total_bw_scale),
++	EVENT_PTR(intel_cqm_local_bw_scale),
++	EVENT_PTR(intel_cqm_avg_total_bw_scale),
++	EVENT_PTR(intel_cqm_avg_local_bw_scale),
++	EVENT_PTR(intel_cqm_llc_snapshot),
++	EVENT_PTR(intel_cqm_total_bw_snapshot),
++	EVENT_PTR(intel_cqm_local_bw_snapshot),
++	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
++	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
++	NULL,
++};
++
+ static struct attribute_group intel_cqm_events_group = {
+ 	.name = "events",
+-	.attrs = intel_cqm_events_attr,
++	.attrs = NULL,
+ };
+ 
+ PMU_FORMAT_ATTR(event, "config:0-7");
+@@ -1279,7 +1423,24 @@ static inline void cqm_pick_event_reader(int cpu)
+ 	cpumask_set_cpu(cpu, &cqm_cpumask);
+ }
+ 
+-static void intel_cqm_cpu_starting(unsigned int cpu)
++static int intel_mbm_cpu_prepare(unsigned int cpu)
++{
++	struct mbm_pmu *pmu = per_cpu(mbm_pmu, cpu);
++
++	if ((!pmu) && (is_mbm)) {
++		pmu = kzalloc_node(sizeof(*mbm_pmu), GFP_KERNEL, NUMA_NO_NODE);
++		if (!pmu)
++			return  -ENOMEM;
++		INIT_LIST_HEAD(&pmu->active_list);
++		pmu->pmu = &intel_cqm_pmu;
++		pmu->timer_interval = ms_to_ktime(MBM_TIME_DELTA_EXP);
++		per_cpu(mbm_pmu, cpu) = pmu;
++		mbm_hrtimer_init(pmu);
++	}
++	return 0;
++}
++
++static int intel_cqm_cpu_starting(unsigned int cpu)
+ {
+ 	struct intel_pqr_state *state = &per_cpu(pqr_state, cpu);
+ 	struct cpuinfo_x86 *c = &cpu_data(cpu);
+@@ -1290,6 +1451,8 @@ static void intel_cqm_cpu_starting(unsigned int cpu)
+ 
+ 	WARN_ON(c->x86_cache_max_rmid != cqm_max_rmid);
+ 	WARN_ON(c->x86_cache_occ_scale != cqm_l3_scale);
++
++	return intel_mbm_cpu_prepare(cpu);
+ }
+ 
+ static void intel_cqm_cpu_exit(unsigned int cpu)
+@@ -1318,13 +1481,15 @@ static int intel_cqm_cpu_notifier(struct notifier_block *nb,
+ 				  unsigned long action, void *hcpu)
+ {
+ 	unsigned int cpu  = (unsigned long)hcpu;
+-
++	int ret;
+ 	switch (action & ~CPU_TASKS_FROZEN) {
+ 	case CPU_DOWN_PREPARE:
+ 		intel_cqm_cpu_exit(cpu);
+ 		break;
+ 	case CPU_STARTING:
+-		intel_cqm_cpu_starting(cpu);
++		ret = intel_cqm_cpu_starting(cpu);
++		if (ret)
++			return ret;
+ 		cqm_pick_event_reader(cpu);
+ 		break;
+ 	}
+@@ -1337,12 +1502,78 @@ static const struct x86_cpu_id intel_cqm_match[] = {
+ 	{}
+ };
+ 
++static const struct x86_cpu_id intel_mbm_match[] = {
++	{ .vendor = X86_VENDOR_INTEL, .feature = X86_FEATURE_CQM_MBM_LOCAL },
++	{}
++};
++
++static int  intel_mbm_init(void)
++{
++	u32 i;
++	int ret, array_size;
++	char scale[20], *str = NULL;
++
++	if (!x86_match_cpu(intel_mbm_match))
++		return -ENODEV;
++	is_mbm = true;
++	/*
++	 * MBM counter values are  in Bytes. To convert this to MBytes:
++	 * Bytes / 1.0e6 gives the MBytes.  Hardware uses upscale factor
++	 * as given by cqm_l3_scale. Muliply upscale factor by 1/1.0e6
++	 * to set the scale to get the perf output in MBytes/sec
++	 */
++
++	snprintf(scale, sizeof(scale), "%u%s", cqm_l3_scale, "e-6");
++	str = kstrdup(scale, GFP_KERNEL);
++	if (!str) {
++		is_mbm = false;
++		return -ENOMEM;
++	}
++	if (cqm_llc_occ)
++		intel_cqm_events_group.attrs =
++			  intel_cmt_mbm_events_attr;
++	else
++		intel_cqm_events_group.attrs = intel_mbm_events_attr;
++
++	for_each_possible_cpu(i) {
++		mbm_socket_max = max(mbm_socket_max,
++				     topology_physical_package_id(i));
++	}
++
++	array_size = (cqm_max_rmid + 1) * mbm_socket_max;
++	mbm_local = kzalloc_node(sizeof(struct sample) * array_size,
++				 GFP_KERNEL, NUMA_NO_NODE);
++	if (!mbm_local) {
++		ret = -ENOMEM;
++		goto free_str;
++	}
++
++	mbm_total = kzalloc_node(sizeof(struct sample) * array_size,
++				 GFP_KERNEL, NUMA_NO_NODE);
++	if (!mbm_total) {
++		ret = -ENOMEM;
++		goto free_local;
++	}
++	event_attr_intel_cqm_local_bw_scale.event_str = str;
++	event_attr_intel_cqm_total_bw_scale.event_str = str;
++	event_attr_intel_cqm_avg_local_bw_scale.event_str = str;
++	event_attr_intel_cqm_avg_total_bw_scale.event_str = str;
++	return 0;
++free_local:
++	kfree(mbm_local);
++free_str:
++	kfree(str);
++	is_mbm = false;
++	return ret;
++}
++
+ static int __init intel_cqm_init(void)
+ {
+ 	char *str = NULL, scale[20];
+ 	int i, cpu, ret = 0;
+ 
+-	if (!x86_match_cpu(intel_cqm_match))
++	if ((!x86_match_cpu(intel_cqm_match)) &&
++	    (!x86_match_cpu(intel_mbm_match)))
+ 		return -ENODEV;
+ 
+ 	cqm_l3_scale = boot_cpu_data.x86_cache_occ_scale;
+@@ -1370,6 +1601,9 @@ static int __init intel_cqm_init(void)
+ 			goto out;
+ 		}
+ 	}
++	if (x86_match_cpu(intel_cqm_match)) {
++		cqm_llc_occ = true;
++		intel_cqm_events_group.attrs = intel_cqm_events_attr;
+ 
+ 	/*
+ 	 * A reasonable upper limit on the max threshold is the number
+@@ -1389,13 +1623,18 @@ static int __init intel_cqm_init(void)
+ 	}
+ 
+ 	event_attr_intel_cqm_llc_scale.event_str = str;
+-
++	}
++	ret = intel_mbm_init();
++	if ((ret) && (!cqm_llc_occ))
++		goto out;
+ 	ret = intel_cqm_setup_rmid_cache();
+ 	if (ret)
+ 		goto out;
+ 
+ 	for_each_online_cpu(i) {
+-		intel_cqm_cpu_starting(i);
++		ret = intel_cqm_cpu_starting(i);
++		if (ret)
++			goto out;
+ 		cqm_pick_event_reader(i);
+ 	}
+ 
+@@ -1410,9 +1649,13 @@ static int __init intel_cqm_init(void)
+ out:
+ 	cpu_notifier_register_done();
+ 
+-	if (ret)
++	if (ret) {
+ 		kfree(str);
+-
++		if (is_mbm) {
++			kfree(mbm_local);
++			kfree(mbm_total);
++		}
++	}
+ 	return ret;
+ }
+ device_initcall(intel_cqm_init);
+-- 
+2.1.0
+

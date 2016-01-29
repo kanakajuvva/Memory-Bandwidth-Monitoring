@@ -1,0 +1,522 @@
+From 90916c85e3653079443d245a323bb2e9907a1eb5 Mon Sep 17 00:00:00 2001
+Message-Id: <90916c85e3653079443d245a323bb2e9907a1eb5.1452107641.git.kanaka.d.juvva@linux.intel.com>
+In-Reply-To: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+References: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+From: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+Date: Tue, 8 Dec 2015 06:10:47 -0800
+Subject: [PATCH v9-pre-release_for_4_3_rc4-01062016 5/5] perf,x86: Running
+ average feature in perf for bandwidth type events
+
+ Calcualte moving average of memory bandwidth for
+ intel_cqm/local_bw and intel_cqm/total_bw is implemented in perf
+ tool. In interval mode, perf tool (user space) calculates running
+ average of last '.runavg_nosamples' memory bandwidth for MBM event
+ counters and this bandwidth value printed in perf output.
+
+ For non-interval mode, running average is not required; in
+ non-interval mode the one most recent monitoring sample's value
+ is provided.
+
+Signed-off-by: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+Signed-off-by: kanakajuvva@gmail.com <kanaka.d.juvva@linux.intel.com>
+---
+ arch/x86/kernel/cpu/perf_event_intel_cqm.c | 73 +++++++++++++++++++++++-------
+ tools/perf/builtin-stat.c                  |  8 ++++
+ tools/perf/util/evsel.c                    |  1 +
+ tools/perf/util/evsel.h                    |  7 +++
+ tools/perf/util/parse-events.c             |  1 +
+ tools/perf/util/pmu.c                      | 58 ++++++++++++++++++++++++
+ tools/perf/util/pmu.h                      |  2 +
+ tools/perf/util/stat.c                     | 67 +++++++++++++++++++++++++++
+ tools/perf/util/stat.h                     |  3 ++
+ 9 files changed, 204 insertions(+), 16 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_cqm.c b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index 812edf0..abd48fb 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@ -20,6 +20,10 @@
+ #define MBM_CNTR_MAX		0xffffff
+ 
+ /*
++ *  Maximum number of MBM event types supported
++ */
++#define MAX_MBM_EVENT_TYPES 1
++/*
+  * Expected time interval in ms between consecutive MSR reads for a given rmid
+  */
+ #define MBM_TIME_DELTA_EXP	1000
+@@ -27,13 +31,9 @@
+ /*
+  *  Minimum time interval in ms between consecutive MSR reads for a given rmid
+  */
+-#define MBM_TIME_DELTA_MIN	100
++#define MBM_TIME_DELTA_MIN	(100 * MAX_MBM_EVENT_TYPES)
+ 
+ /*
+- * Number of milli secondss in a second
+- */
+-#define MBM_CONVERSION_FACTOR	1000
+-/*
+  * Minimum size for sliding window i.e. the minimum monitoring period for
+  * application(s). This fifo_size can be used for short duration monitoring
+  * since short duration monitoring will have less number of samples.
+@@ -107,8 +107,11 @@ struct mbm_pmu {
+ /**
+  * struct sample - mbm event's (local or total) data
+  * @bytes:         previous MSR value
+- * @bandwidth:     memory bandwidth
+- * @prev_time:     time stamp of previous sample i.e. {bytes, bandwidth}
++ * @runavg:        running average of memory bandwidth
++ * @prev_time:     time stamp of previous sample i.e. {bytes, runavg}
++ * @index:         current sample number
++ * @fifoin:        sliding window counter to store the sample
++ * @fifoout:       start of the sliding window to calculate  bandwidh sum
+  */
+ struct sample {
+ 	u64 bytes;
+@@ -306,12 +309,16 @@ static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid)
+  */
+ static void mbm_reset_stats(u32 rmid)
+ {
+-	u32  vrmid =  rmid_2_index(rmid);
++	u32  i, vrmid;
+ 
+ 	if (!is_mbm)
+ 		return;
+-	memset(&mbm_local[vrmid], 0, sizeof(struct sample));
+-	memset(&mbm_total[vrmid], 0, sizeof(struct sample));
++	for (i=0; i < mbm_socket_max; i++) {
++		vrmid =  i * cqm_max_rmid + rmid;
++		memset(&mbm_local[vrmid], 0, sizeof(struct sample));
++		memset(&mbm_total[vrmid], 0, sizeof(struct sample));
++	}
++
+ }
+ 
+ /*
+@@ -330,7 +337,6 @@ static u32 __get_rmid(void)
+ 
+ 	entry = list_first_entry(&cqm_rmid_free_lru, struct cqm_rmid_entry, list);
+ 	list_del(&entry->list);
+-
+ 	return entry->rmid;
+ }
+ 
+@@ -696,7 +702,7 @@ static u32 __mbm_fifo_sum_lastn_out(struct sample *bw_stat)
+ 		bw_stat->fifoout =  0;
+ 	index =  bw_stat->fifoout;
+ 	for (i = 0; i < mbm_window_size - 1; i++) {
+-		if (index + i == mbm_window_size)
++		if ((index + i) >= mbm_window_size)
+ 			j = index + i - mbm_window_size;
+ 		else
+ 			j = index + i;
+@@ -773,9 +779,13 @@ static u64 rmid_read_mbm(unsigned int rmid, enum mbm_evt_type evt_type)
+ 	}
+ 
+ 	prevavg = mbm_current->runavg;
+-	currentbw = mbm_current->mbmfifo[mbm_current->fifoin];
++	if (mbm_current->fifoin > 0)
++		currentbw = mbm_current->mbmfifo[mbm_current->fifoin-1];
++	else
++		currentbw = prevavg;
+ 	diff_time = ktime_ms_delta(cur_time,
+ 				   mbm_current->prev_time);
++
+ 	if (diff_time > MBM_TIME_DELTA_MIN) {
+ 
+ 		wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
+@@ -1259,10 +1269,26 @@ static void intel_cqm_setup_event(struct perf_event *event,
+ 		struct cqm_rmid_entry *entry;
+ 
+ 		entry = __rmid_entry(rmid);
+-		entry->is_cqm = true;
++		entry->is_cqm = false;
+ 	}
+ 
+ 	event->hw.cqm_rmid = rmid;
++	if ((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) && 
++	    (event->attr.config <= QOS_MBM_LOCAL_AVG_EVENT_ID)) {
++		int i, index;
++		struct sample * mbm_current;
++		ktime_t cur_time = ktime_get();
++		rmid_read_mbm(rmid, event->attr.config);
++		for (i=0; i < mbm_socket_max; i++) {
++			index =  i * cqm_max_rmid +  rmid;
++			if (event->attr.config & QOS_MBM_LOCAL_EVENT_MASK)
++				mbm_current = &mbm_local[index];
++			else
++				mbm_current = &mbm_total[index];
++			mbm_current->prev_time = cur_time;
++		}
++		//rmid_read_mbm(rmid, event->attr.config);
++	}
+ }
+ 
+ static void intel_cqm_event_read(struct perf_event *event)
+@@ -1439,8 +1465,10 @@ static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
+ 
+ 	if (!pmu->n_active)
+ 		return HRTIMER_NORESTART;
++	//preempt_disable();
+ 	list_for_each_entry(event, &pmu->active_list, active_entry)
+ 		intel_mbm_event_update(event);
++	//preempt_enable();
+ 	hrtimer_forward_now(hrtimer, pmu->timer_interval);
+ 	return HRTIMER_RESTART;
+ }
+@@ -1513,6 +1541,7 @@ static void intel_mbm_event_stop(struct perf_event *event, int mode)
+ static void intel_cqm_event_stop(struct perf_event *event, int mode)
+ {
+ 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
++	bool mbm_stop = false;
+ 
+ 	if (event->hw.cqm_state & PERF_HES_STOPPED)
+ 		return;
+@@ -1523,8 +1552,10 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
+ 		intel_cqm_event_read(event);
+ 
+ 	if ((event->attr.config >= QOS_MBM_TOTAL_EVENT_ID) &&
+-	    (event->attr.config <= QOS_MBM_LOCAL_EVENT_ID))
++	    (event->attr.config <= QOS_MBM_LOCAL_EVENT_ID)) {
+ 		intel_mbm_event_update(event);
++		mbm_stop = true;
++	}
+ 
+ 	if (!--state->rmid_usecnt) {
+ 		state->rmid = 0;
+@@ -1533,7 +1564,8 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
+ 		WARN_ON_ONCE(!state->rmid);
+ 	}
+ 
+-	intel_mbm_event_stop(event, mode);
++	if (mbm_stop)
++		intel_mbm_event_stop(event, mode);
+ }
+ 
+ static int intel_cqm_event_add(struct perf_event *event, int mode)
+@@ -1662,6 +1694,11 @@ EVENT_ATTR_STR(total_bw.per-pkg, intel_cqm_total_bw_pkg, "1");
+ EVENT_ATTR_STR(total_bw.unit, intel_cqm_total_bw_unit, "MB/sec");
+ EVENT_ATTR_STR(total_bw.scale, intel_cqm_total_bw_scale, NULL);
+ EVENT_ATTR_STR(total_bw.snapshot, intel_cqm_total_bw_snapshot, "1");
++EVENT_ATTR_STR(total_bw.runavg_nosamples,
++				intel_cqm_total_bw_runavg_nosamples, "10");
++EVENT_ATTR_STR(local_bw.runavg_nosamples,
++				intel_cqm_local_bw_runavg_nosamples, "10");
++
+ 
+ EVENT_ATTR_STR(local_bw, intel_cqm_local_bw, "event=0x03");
+ EVENT_ATTR_STR(local_bw.per-pkg, intel_cqm_local_bw_pkg, "1");
+@@ -1711,6 +1748,8 @@ static struct attribute *intel_mbm_events_attr[] = {
+ 	EVENT_PTR(intel_cqm_local_bw_snapshot),
+ 	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
+ 	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
++	EVENT_PTR(intel_cqm_total_bw_runavg_nosamples),
++	EVENT_PTR(intel_cqm_local_bw_runavg_nosamples),
+ 	NULL,
+ };
+ 
+@@ -1740,6 +1779,8 @@ static struct attribute *intel_cmt_mbm_events_attr[] = {
+ 	EVENT_PTR(intel_cqm_local_bw_snapshot),
+ 	EVENT_PTR(intel_cqm_avg_total_bw_snapshot),
+ 	EVENT_PTR(intel_cqm_avg_local_bw_snapshot),
++	EVENT_PTR(intel_cqm_total_bw_runavg_nosamples),
++	EVENT_PTR(intel_cqm_local_bw_runavg_nosamples),
+ 	NULL,
+ };
+ 
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 2f438f7..eef2a91 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -589,6 +589,11 @@ static void print_aggr(char *prefix)
+ 				run += perf_counts(counter->counts, cpu, 0)->run;
+ 				nr++;
+ 			}
++
++			if ((stat_config.interval) &&
++			   (counter->runavg_nosamples > 0))
++				val = perf_evsel_run_avg(counter, val);
++
+ 			if (prefix)
+ 				fprintf(output, "%s", prefix);
+ 
+@@ -680,6 +685,9 @@ static void print_counter_aggr(struct perf_evsel *counter, char *prefix)
+ 	double uval;
+ 	double avg_enabled, avg_running;
+ 
++	if ((stat_config.interval) && (counter->runavg_nosamples > 0))
++		avg = perf_evsel_run_avg(counter, avg);
++
+ 	avg_enabled = avg_stats(&ps->res_stats[1]);
+ 	avg_running = avg_stats(&ps->res_stats[2]);
+ 
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 397fb4e..a3aadcd 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -207,6 +207,7 @@ void perf_evsel__init(struct perf_evsel *evsel,
+ 	evsel->leader	   = evsel;
+ 	evsel->unit	   = "";
+ 	evsel->scale	   = 1.0;
++	evsel->runavg_nosamples = 0;
+ 	evsel->evlist	   = NULL;
+ 	evsel->bpf_fd	   = -1;
+ 	INIT_LIST_HEAD(&evsel->node);
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index 0e49bd7..c2edd13 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -114,6 +114,13 @@ struct perf_evsel {
+ 	bool			tracking;
+ 	bool			per_pkg;
+ 	bool			precise_max;
++	double			runavg_nosamples;
++	unsigned int		fifoin;
++	unsigned int		fifoout;
++	u64			run_avg;
++	u64			*fifo;
++	unsigned int		index;
++
+ 	/* parse modifier helper */
+ 	int			exclude_GH;
+ 	int			nr_members;
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index bee6058..c2997c9 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -1023,6 +1023,7 @@ int parse_events_add_pmu(struct parse_events_evlist *data,
+ 		evsel->scale = info.scale;
+ 		evsel->per_pkg = info.per_pkg;
+ 		evsel->snapshot = info.snapshot;
++		evsel->runavg_nosamples = info.runavg_nosamples;
+ 	}
+ 
+ 	return evsel ? 0 : -ENOMEM;
+diff --git a/tools/perf/util/pmu.c b/tools/perf/util/pmu.c
+index e4b173d..abc627c 100644
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@ -141,6 +141,57 @@ error:
+ 	return ret;
+ }
+ 
++static int perf_pmu__parse_runavg(struct perf_pmu_alias *alias,
++				  char *dir, char *name)
++{
++	struct stat st;
++	ssize_t sret;
++	char nosamples[128];
++	int fd, ret = -1;
++	char path[PATH_MAX];
++	const char *lc;
++
++	snprintf(path, PATH_MAX, "%s/%s.runavg_nosamples", dir, name);
++
++	fd = open(path, O_RDONLY);
++	if (fd == -1)
++		return -1;
++
++	if (fstat(fd, &st) < 0)
++		goto error;
++
++	sret = read(fd, nosamples, sizeof(nosamples)-1);
++	if (sret < 0)
++		goto error;
++
++	if (nosamples[sret - 1] == '\n')
++		nosamples[sret - 1] = '\0';
++	else
++		nosamples[sret] = '\0';
++
++	/*
++	 * save current locale
++	 */
++	lc = setlocale(LC_NUMERIC, NULL);
++
++	/*
++	 * force to C locale to ensure kernel
++	 * scale string is converted correctly.
++	 * kernel uses default C locale.
++	 */
++	setlocale(LC_NUMERIC, "C");
++
++	alias->runavg_nosamples = strtod(nosamples, NULL);
++
++	/* restore locale */
++	setlocale(LC_NUMERIC, lc);
++
++	ret = 0;
++error:
++	close(fd);
++	return ret;
++}
++
+ static int perf_pmu__parse_unit(struct perf_pmu_alias *alias, char *dir, char *name)
+ {
+ 	char path[PATH_MAX];
+@@ -220,6 +271,7 @@ static int __perf_pmu__new_alias(struct list_head *list, char *dir, char *name,
+ 	alias->scale = 1.0;
+ 	alias->unit[0] = '\0';
+ 	alias->per_pkg = false;
++	alias->runavg_nosamples = 0;
+ 
+ 	ret = parse_events_terms(&alias->terms, val);
+ 	if (ret) {
+@@ -237,6 +289,7 @@ static int __perf_pmu__new_alias(struct list_head *list, char *dir, char *name,
+ 		perf_pmu__parse_scale(alias, dir, name);
+ 		perf_pmu__parse_per_pkg(alias, dir, name);
+ 		perf_pmu__parse_snapshot(alias, dir, name);
++		perf_pmu__parse_runavg(alias, dir, name);
+ 	}
+ 
+ 	list_add_tail(&alias->list, list);
+@@ -271,6 +324,8 @@ static inline bool pmu_alias_info_file(char *name)
+ 		return true;
+ 	if (len > 9 && !strcmp(name + len - 9, ".snapshot"))
+ 		return true;
++	if (len > 17 && !strcmp(name + len - 17, ".runavg_nosamples"))
++		return true;
+ 
+ 	return false;
+ }
+@@ -873,6 +928,9 @@ int perf_pmu__check_alias(struct perf_pmu *pmu, struct list_head *head_terms,
+ 		if (alias->per_pkg)
+ 			info->per_pkg = true;
+ 
++		if (alias->runavg_nosamples)
++			info->runavg_nosamples = alias->runavg_nosamples;
++
+ 		list_del(&term->list);
+ 		free(term);
+ 	}
+diff --git a/tools/perf/util/pmu.h b/tools/perf/util/pmu.h
+index 5d7e844..be0cc17 100644
+--- a/tools/perf/util/pmu.h
++++ b/tools/perf/util/pmu.h
+@@ -32,6 +32,7 @@ struct perf_pmu_info {
+ 	double scale;
+ 	bool per_pkg;
+ 	bool snapshot;
++	double runavg_nosamples;
+ };
+ 
+ #define UNIT_MAX_LEN	31 /* max length for event unit name */
+@@ -44,6 +45,7 @@ struct perf_pmu_alias {
+ 	double scale;
+ 	bool per_pkg;
+ 	bool snapshot;
++	double runavg_nosamples;
+ };
+ 
+ struct perf_pmu *perf_pmu__find(const char *name);
+diff --git a/tools/perf/util/stat.c b/tools/perf/util/stat.c
+index 2d9d830..e85c5ad 100644
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@ -20,6 +20,70 @@ void update_stats(struct stats *stats, u64 val)
+ 		stats->min = val;
+ }
+ 
++u64 perf_evsel_run_avg(struct perf_evsel *evsel, u64 current)
++{
++	u64 val = 0;
++	u32 i, j, index;
++
++	/*
++	 * Slide the window by 1 and calculate the sum of the last
++	 * size-1  counter  values.
++	 * fifoout is the current position of the window.
++	 * Increment the fifoout by 1 to slide the window by 1.
++	 * Calcalute the sum from ++fifoout  to ( ++fifoout + size -1)
++	 * e.g.fifoout =1;   val1 val2 ..... valn are the
++	 * sliding window values where n is size of the sliding window
++	* bandwidth sum:  sum  =  val2 + val3 + .. valn
++*/
++	if (evsel->index++ >= evsel->runavg_nosamples) {
++		index =  evsel->fifoout;
++		for (i = 0; i <  evsel->runavg_nosamples - 1;) {
++			if ((index + i) >=  evsel->runavg_nosamples)
++				j = index + i - evsel->runavg_nosamples;
++			else
++				j = index + i;
++			val += evsel->fifo[j];
++			i++;
++		}
++
++		evsel->run_avg = (val + current) / evsel->runavg_nosamples;
++		if (++evsel->fifoout ==  evsel->runavg_nosamples)
++			evsel->fifoout =  0;
++	} else
++		evsel->run_avg = (evsel->run_avg * (evsel->index - 1) +
++				  current) / evsel->index;
++
++	/*
++	 * store current sample's counter value in sliding window at the
++	 * location fifoin. Increment fifoin. Check if fifoin has reached
++	 * size. If yes reset it to beginninng i.e. zero
++	 */
++
++	evsel->fifo[evsel->fifoin] = current;
++	if (++evsel->fifoin == evsel->runavg_nosamples)
++		evsel->fifoin = 0;
++
++	return evsel->run_avg;
++}
++
++int perf_evsel__alloc_rafifo(struct perf_evsel *evsel)
++{
++	if (evsel->runavg_nosamples) {
++		evsel->fifo = zalloc(sizeof(u64) * evsel->runavg_nosamples);
++		if (evsel->fifo == NULL)
++			return -ENOMEM;
++		evsel->fifoin = 0;
++		evsel->fifoout = 0;
++		evsel->index = 0;
++	}
++	return 0;
++}
++
++void perf_evsel__free_rafifo(struct perf_evsel *evsel)
++{
++	free(evsel->fifo);
++}
++
+ double avg_stats(struct stats *stats)
+ {
+ 	return stats->mean;
+@@ -160,6 +224,8 @@ int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw)
+ 	evlist__for_each(evlist, evsel) {
+ 		if (perf_evsel__alloc_stats(evsel, alloc_raw))
+ 			goto out_free;
++		if (perf_evsel__alloc_rafifo(evsel))
++			goto out_free;
+ 	}
+ 
+ 	return 0;
+@@ -177,6 +243,7 @@ void perf_evlist__free_stats(struct perf_evlist *evlist)
+ 		perf_evsel__free_stat_priv(evsel);
+ 		perf_evsel__free_counts(evsel);
+ 		perf_evsel__free_prev_raw_counts(evsel);
++		perf_evsel__free_rafifo(evsel);
+ 	}
+ }
+ 
+diff --git a/tools/perf/util/stat.h b/tools/perf/util/stat.h
+index da1d11c..fd23ac8 100644
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@ -88,6 +88,9 @@ int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw);
+ void perf_evlist__free_stats(struct perf_evlist *evlist);
+ void perf_evlist__reset_stats(struct perf_evlist *evlist);
+ 
++int perf_evsel__alloc_rafifo(struct perf_evsel *evsel);
++void perf_evsel__free_rafifo(struct perf_evsel *evsel);
++u64 perf_evsel_run_avg(struct perf_evsel *evsel, u64 current);
+ int perf_stat_process_counter(struct perf_stat_config *config,
+ 			      struct perf_evsel *counter);
+ #endif
+-- 
+2.1.0
+

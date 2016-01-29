@@ -1,0 +1,48 @@
+From f82476930fae4afbe9bf8aa16aceeea402b4a1ff Mon Sep 17 00:00:00 2001
+Message-Id: <f82476930fae4afbe9bf8aa16aceeea402b4a1ff.1452107641.git.kanaka.d.juvva@linux.intel.com>
+In-Reply-To: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+References: <cover.1452107641.git.kanaka.d.juvva@linux.intel.com>
+From: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+Date: Wed, 11 Nov 2015 20:58:42 -0800
+Subject: [PATCH v9-pre-release_for_4_3_rc4-01062016 2/5] perf,x86: fix str
+ leak when intel_cqm_init fails
+
+intel_cqm_init allocates str using kstrdup and sets str to scale value
+which is used by perf user space in LLC occupancy calculations. If
+initialization fails, we should free str if it was allocated.
+intel_cqm_init frees str, when initialization fails; hence this fixes
+str memory leak.
+
+Signed-off-by: Kanaka Juvva <kanaka.d.juvva@linux.intel.com>
+---
+ arch/x86/kernel/cpu/perf_event_intel_cqm.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_cqm.c b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+index f68969d..2950654 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_cqm.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_cqm.c
+@@ -1339,8 +1339,8 @@ static const struct x86_cpu_id intel_cqm_match[] = {
+ 
+ static int __init intel_cqm_init(void)
+ {
+-	char *str, scale[20];
+-	int i, cpu, ret;
++	char *str = NULL, scale[20];
++	int i, cpu, ret = 0;
+ 
+ 	if (!x86_match_cpu(intel_cqm_match))
+ 		return -ENODEV;
+@@ -1410,6 +1410,9 @@ static int __init intel_cqm_init(void)
+ out:
+ 	cpu_notifier_register_done();
+ 
++	if (ret)
++		kfree(str);
++
+ 	return ret;
+ }
+ device_initcall(intel_cqm_init);
+-- 
+2.1.0
+
