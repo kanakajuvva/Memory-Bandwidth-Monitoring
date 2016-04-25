@@ -1,0 +1,11 @@
+ 1347  fdisk   luv-live-v2.0-rc1.img
+ 1348  sudo mount -o,offset=8389120  luv-live-v2.0-rc1.img   /tmp/x
+ 1349  ls -l /tmp/x/
+ 1351  sudo vi /tmp/x/EFI/BOOT/grub.cfg 
+ 1352  sudo umount /tmp/x 
+ 1359  history | grep dd
+ 1360  sudo dd  if=luv-live-v2.0-rc1.img  of=/dev/sdb
+
+newer images:
+sudo mount -o,offset=16777728  luv-live-v2.0.img   /tmp/x
+

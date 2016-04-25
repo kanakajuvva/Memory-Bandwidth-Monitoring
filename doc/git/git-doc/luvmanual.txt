@@ -1,0 +1,21 @@
+$mount -o,offset=1677728 /tmp/luv-live-image.img /tmp/x
+
+$vi /tmp/x/EFI/BOOT/grub.cfg
+
+# add noluv to the kernel parameters (in th linux entry of grub)
+
+
+# reflash your USB stick
+
+dd if=/luv-live-image.img of=/dev/sdX
+
+
+# reboot LUV
+
+# from the command line 
+
+/etc/luv/tests/fwts
+
+
+#if the crash is reproducible you will see a segfault when running FTWS
+

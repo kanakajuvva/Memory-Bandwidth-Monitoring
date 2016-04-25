@@ -1,0 +1,1 @@
+git send-email --to kanaka.d.juvva@intel.com  --to edwin.verplanke@intel.com --to andrew.j.herdrich@intel.com --to andi@firstfloor.org  ./0003-perf-x86-Add-Intel-Memory-Bandwidth-Monitoring-MBM-s.patch

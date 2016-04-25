@@ -1,0 +1,32 @@
+$ git am PATCH
+If all goes well you should find the patch integrated into your repo.
+
+In case of failure this gets a bit more complicated.
+
+If you try to google for “git am fail” you’ll find this post which unfortunately is quite outdated, and I couldn’t find reference to the problem in the git manual (or maybe I didn’t stare enough into it).
+
+So you just tried git am PATCH, and get this:
+
+$ git am PATCH
+Applying: PACTH DESCRIPTION
+error: patch failed: file.c:137
+error: file.c: patch does not apply
+error: patch failed: Makefile:24
+error: libavfilter/Makefile: patch does not apply
+Patch failed at 0001 PATCH DESCRIPTION
+When you have resolved this problem run "git am --resolved".
+If you would prefer to skip this patch, instead run "git am --skip".
+To restore the original branch and stop patching run "git am --abort".
+In these cases git will just complain and stop. No bits from the patch are applied if a single conflict is found.
+
+The simplest way for dealing with it would be to git am –abort, apply the patch manually by patch -p1 < PATCH, resolve the conflict by hand, and finally commit with git commit -a, but in this case you’ll have to rewrite the commit message, which is not very nice. There is a more clever way.
+
+You can find the corresponding patch file stored in .git/rebase-apply, and named “0001″ (the name of the dir where the patch is stored changed recently, this is tested with 1.7.4.1).
+At this point you can use git apply for applying the patch, which is the git equivalent of the patch command, and fix the conflicting files the usual way (you check the .rej files, compare them with the conflicting files and finally add the fixed files to the index):
+
+$ git apply PATCH --reject
+$ edit edit edit
+$ git add FIXED_FILES
+$ git am --resolved
+and you’re done!
+In other words, since git am didn’t change the index, you need to git apply –reject the patch (stored in .git/rebase-apply), fix conflicts by hand, add the changed files and finally tell git that you resolved the trouble. The advantage in this case is that you don’t need to re-edit the commit message, and in the case you’re applying a set of patches (that is you’re using git am PATCHES, where PATCHES is a mailbox) you don’t have to git abort and run git am again.

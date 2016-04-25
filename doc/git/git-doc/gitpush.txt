@@ -1,0 +1,18 @@
+[kjuvva@kanaka linux]$ git commit -s -v --amend 
+fatal: You are in the middle of a merge -- cannot amend.
+[kjuvva@kanaka linux]$ git add arch/x86/kernel/cpu/perf_event_intel_cqm.c 
+[kjuvva@kanaka linux]$ git commit -s -v --amend 
+fatal: You are in the middle of a merge -- cannot amend.
+[kjuvva@kanaka linux]$ gvim arch/x86/kernel/cpu/perf_event_intel_cqm.c
+[kjuvva@kanaka linux]$ git diff
+[kjuvva@kanaka linux]$ git commit -s -v 
+[MBM_PRE_RELEASE_v9 96ca534] Merge branch 'MBM_PRE_RELEASE_v9' of https://github.com/kanakajuvva/linux into MBM_PRE_RELEASE_v9
+[kjuvva@kanaka linux]$ git push -u upstream  MBM_PRE_RELEASE_v9
+Counting objects: 14, done.
+Delta compression using up to 8 threads.
+Compressing objects: 100% (14/14), done.
+Writing objects: 100% (14/14), 1.37 KiB | 0 bytes/s, done.
+Total 14 (delta 12), reused 0 (delta 0)
+To https://github.com/kanakajuvva/linux.git
+   503998f6..96ca534 MBM_PRE_RELEASE_v9 -> MBM_PRE_RELEASE_v9
+Branch MBM_PRE_RELEASE_v9 set up to track remote branch MBM_PRE_RELEASE_v9 from upstream.

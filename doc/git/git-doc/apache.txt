@@ -1,0 +1,38 @@
+Apache's ProxyPass on Ubuntu
+
+20
+OCT
+Install apache2. On Ubuntu type:
+ # apt-get install apache2
+Activate mod_proxy:
+ # a2enmod proxy
+Create a new file in /etc/apache2/sites-available, named metak (or whatever):
+NameVirtualHost *
+<Virtualhost *>
+  DocumentRoot "/var/www/metak"
+  ServerName localhost
+  ServerAdmin support@mycompany.com
+  DirectoryIndex index.html index.phpProxyRequests On
+  ProxyPreserveHost On
+  ProxyVia full
+
+  <proxy>
+    Order deny,allow
+    Allow from all
+  </proxy>
+
+  ProxyPass        /  http://www.metak.com
+  ProxyPassReverse /  http://www.metak.com
+</Virtualhost>
+Enable the new site and restart apache2:
+# a2ensite metak
+# /etc/init.d/apache2 reload
+
+ProxyPass / http://www.metak.com/
+
+since otherwise links to a page page.html become http://www.metak.compage.html (slash missing).
+
+– end / needed for ProxyPass & ProxyPassReverse
+– a2enmod proxy_http needed
+
+… and it will work like a charm

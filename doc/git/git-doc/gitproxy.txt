@@ -1,0 +1,37 @@
+
+t
+Aug 9, 2012 • Ender Dai
+Git works with git/ssh/http/https protocols and we need to use different ways to proxy them, which are summarized as below.
+
+git
+
+To proxy git running git protocol, we need
+
+A working socks proxy server, and
+BSD netcat as a helper utility. Please note that the so called traditional netcat doesn’t fit our need as there is not proxy support.
+$ cat ~/bin/socks-gateway.sh
+#!/bin/bash
+
+METHOD="-X 5 -x proxy-prc.intel.com:1080"
+/bin/nc $METHOD $*
+
+$ export GIT_PROXY_COMMAND=~/bin/socks-gateway.sh
+
+$ git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+Cloning into 'linux'...
+remote: Counting objects: 97264
+....
+http/https
+
+Git utilize curl to fetch data over http/https, so we can simply point the environment variable http_proxy or https_proxy to our proxy server and then it is all set.
+
+$ export http_proxy=http://proxy-prc.intel.com:911
+$ git clone http://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+Cloning into 'linux'...
+remote: Counting objects: 45896
+...
+
+$ export https_proxy=http://proxy-prc.intel.com:911
+$ git clone https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+Cloning into 'linux'...
+remote: Counting objects: 93630

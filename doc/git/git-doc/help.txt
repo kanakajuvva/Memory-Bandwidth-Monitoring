@@ -1,0 +1,34 @@
+
+sudo mount -o,offset=8389120  luv-live-v2.0-rc1.img   /tmp/x
+[kjuvva@kanaka Images]$ fdisk   luv-live-v2.0-rc1.img
+
+Welcome to fdisk (util-linux 2.25.2).
+Changes will remain in memory only, until you decide to write them.
+Be careful before using the write command.
+
+
+Command (m for help): b
+There is no *BSD partition on luv-live-v2.0-rc1.img.
+
+The device (null) does not contain BSD disklabel.
+
+Do you want to create a BSD disklabel? [Y]es/[N]o: n
+
+Command (m for help): p
+
+Disk luv-live-v2.0-rc1.img: 80.1 MiB, 83952128 bytes, 163969 sectors
+Units: sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disklabel type: dos
+Disk identifier: 0x000c6a11
+
+Device                 Boot Start    End Sectors  Size Id Type
+luv-live-v2.0-rc1.img1          1  16384   16384    8M  c W95 FAT32 (LBA)
+luv-live-v2.0-rc1.img2 *    16385 163968  147584 72.1M  c W95 FAT32 (LBA)
+
+
+Command (m for help): q
+
+
+

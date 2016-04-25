@@ -1,0 +1,12 @@
+git log --after="2014-7-1" --before="2014-7-4"
+git log --author="John"
+get log --after="yesterday"
+git log --grep="JRA-224:"
+git log -- foo.py bar.py
+git log -S"Hello, World!"
+git log master..feature
+git log --no-merges
+git log --merges
+
+
+git reset --hard HEAD^

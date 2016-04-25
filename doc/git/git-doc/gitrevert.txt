@@ -1,0 +1,81 @@
+bitbake -c devhsell fwts
+
+
+git show 34c73cde961c293e6e2cd0cc650f77bfdcfe03ca
+
+git revert 34c73cde961c293e6e2cd0cc650f77bfdcfe03ca
+
+git show
+
+git format-patch HEAD^
+
+cp 0001-Revert-cpu-cpufreq-Iterate-over-the-correct-number-o.patch /tmp
+
+
+mv /tmp/0001-Revert-cpu-cpufreq-Iterate-over-the-correct-number-o.patch ../meta-luv/recipes-core/fwts/fwts
+
+vi  ../meta-luv/recipes-core/fwts/fwts_git.bb
+
+
+Your changes should look like:
+
+
+diff --git a/meta-luv/recipes-core/fwts/fwts_git.bb
+
+b/meta-luv/recipes-core/fwts/fwts_git.bb
+
+index dacef0a..87488b3 100644
+
+--- a/meta-luv/recipes-core/fwts/fwts_git.bb
+
++++ b/meta-luv/recipes-core/fwts/fwts_git.bb
+
+@@ -9,6 +9,7 @@ PV = "V16.01.00+git${SRCPV}"
+
+ SRCREV = "2496948dba3a2253ad4148dc11009e338b66ee50"
+
+ SRC_URI = "git://kernel.ubuntu.com/hwe/fwts.git \
+
+            file://luv-parser-fwts \
+
++
+
+file://0001-Revert-cpu-cpufreq-Iterate-over-the-correct-number-o.patch \
+
+           "
+
+ 
+
+ S = "${WORKDIR}/git"
+
+
+
+
+On mié, 2016-02-24 at 14:58 -0800, Ricardo Neri wrote:
+
+> Hi Kanaka,
+
+> 
+
+> Here is the commit that fixed the segfault that I described to you
+
+> during th meeting.
+
+> 
+
+> http://kernel.ubuntu.com/git/hwe/fwts.git/commit/?id=34c73cde961c293e6e2cd0cc650f77bfdcfe03ca
+
+> 
+
+> You can revert this and reproduce the crash. It is not reproducible on
+
+> any system. I do have a system in which it can be reproduced. Let me
+
+> know if you want to give it a try.
+
+> 
+
+> Thanks and BR,
+
+> Ricardo
+

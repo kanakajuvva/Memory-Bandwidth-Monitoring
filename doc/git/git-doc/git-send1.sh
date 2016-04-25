@@ -1,0 +1,1 @@
+git send-email --to kanaka.d.juvva@intel.com  --to ravi.v.shankar@intel.com --to glenn.p.williamson@intel.com   --to  will.auld@intel.com  --to tony.luck@intel.com  --to  h.peter.anvin@intel.com   ./0001-perf-x86-skip-intel_cqm_stable-if-no-CQM-event-is-us.patch 
