@@ -1,0 +1,1 @@
+make  bzImage modules
